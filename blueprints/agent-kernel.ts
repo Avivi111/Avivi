@@ -1,13 +1,33 @@
 /**
  * Reference runtime for the Avivi agent kernel.
  *
- * Valid goals still plan, route, authorize, and complete as before.
- * Invalid configuration and unsafe authority paths fail closed.
+ * The kernel decides status only. It does not execute tools. Hosts execute
+ * an action only after `complete` returns status `complete`.
  *
- * The kernel decides status only. It does not execute tools, persist the
- * audit log, or survive a process restart. Hosts execute an action only
- * after `complete` returns status `complete`.
+ * Stop, audit, and idempotency go through adapters. The default adapters are
+ * process-local. Pass durable adapters before production traffic.
  */
+
+import {
+  createMemoryAuditLog,
+  createMemoryIdempotencyStore,
+  createMemoryStopSwitch,
+  type AuditLog,
+  type IdempotencyRecord,
+  type IdempotencyStore,
+  type StopSwitch,
+} from "./memory-adapters.ts";
+
+export {
+  createMemoryAuditLog,
+  createMemoryIdempotencyStore,
+  createMemoryStopSwitch,
+  type AuditLog,
+  type IdempotencyPut,
+  type IdempotencyRecord,
+  type IdempotencyStore,
+  type StopSwitch,
+} from "./memory-adapters.ts";
 
 export type AgentRisk = "read" | "internal_write" | "external_write" | "money" | "privileged";
 
@@ -70,9 +90,15 @@ export interface AgentKernelConfig {
   alwaysRequireApproval: readonly AgentRisk[];
   /** Defaults to live. Demo never returns `complete` for an external effect. */
   mode?: KernelMode;
-  /** Defaults to any verified item, which is the original evidence rule. */
+  /**
+   * Defaults to `all_verified`. A failed read-back vetoes completion.
+   * Set `any_verified` only when extra unverified notes ride along with one good read-back.
+   */
   evidencePolicy?: EvidencePolicy;
-  /** Defaults to substring, which is the original keyword rule. */
+  /**
+   * Defaults to `token`, so a short keyword does not match inside another word.
+   * Set `substring` to keep the previous fragment-matching rule.
+   */
   keywordMatch?: KeywordMatch;
   /**
    * Optional typed capability registry. When set, every agent capability
@@ -80,8 +106,22 @@ export interface AgentKernelConfig {
    * as an external effect cannot be completed without evidence.
    */
   actionContracts?: readonly CapabilityContract[];
-  /** In-memory audit cap. Defaults to 1000. Oldest events are dropped. */
+  /**
+   * Cap for the default memory audit log. Defaults to 1000.
+   * Ignored when `adapters.auditLog` is provided; that log owns retention.
+   */
   auditLimit?: number;
+}
+
+export interface KernelAdapters {
+  stopSwitch?: StopSwitch;
+  auditLog?: AuditLog;
+  idempotency?: IdempotencyStore;
+  /**
+   * Extra redaction applied to text before the built-in audit redaction.
+   * Throw to drop the text instead of writing it. The thrown message is not stored.
+   */
+  redact?: (text: string) => string;
 }
 
 export interface ResolvedAgentKernelConfig {
@@ -117,11 +157,18 @@ export interface CompleteInput {
   action: KernelAction;
   evidence?: readonly Evidence[];
   approved?: boolean;
+  /**
+   * Caller-owned key for one intended effect. A second `complete` with the
+   * same key and the same action returns the stored result with `replayed: true`.
+   * The kernel does not perform the side effect. Hosts must skip it when `replayed` is true.
+   */
+  idempotencyKey?: string;
 }
 
 export interface CompleteResult {
   status: "needs_approval" | "blocked" | "complete" | "stopped" | "demo";
   reason: string;
+  replayed?: boolean;
 }
 
 export type AuditEventType = "plan" | "route" | "authorize" | "complete" | "emergency_stop" | "resume";
@@ -260,9 +307,9 @@ function resolveConfig(input: AgentKernelConfig): ResolvedAgentKernelConfig {
 
   const mode = input.mode ?? "live";
   if (mode !== "live" && mode !== "demo") fail("invalid_mode");
-  const evidencePolicy = input.evidencePolicy ?? "any_verified";
+  const evidencePolicy = input.evidencePolicy ?? "all_verified";
   if (evidencePolicy !== "any_verified" && evidencePolicy !== "all_verified") fail("invalid_evidence_policy");
-  const keywordMatch = input.keywordMatch ?? "substring";
+  const keywordMatch = input.keywordMatch ?? "token";
   if (keywordMatch !== "substring" && keywordMatch !== "token") fail("invalid_keyword_match");
 
   const auditLimit = input.auditLimit ?? DEFAULT_AUDIT_LIMIT;
@@ -293,17 +340,63 @@ function compileMatcher(keyword: string, mode: KeywordMatch): (goalLower: string
   return (goalLower) => pattern.test(goalLower);
 }
 
-function redact(value: string): string {
-  return value
+function passesLuhn(digits: string): boolean {
+  let sum = 0;
+  let doubleDigit = false;
+  for (let index = digits.length - 1; index >= 0; index -= 1) {
+    const current = digits.charCodeAt(index) - 48;
+    if (current < 0 || current > 9) return false;
+    let value = current;
+    if (doubleDigit) {
+      value *= 2;
+      if (value > 9) value -= 9;
+    }
+    sum += value;
+    doubleDigit = !doubleDigit;
+  }
+  return sum % 10 === 0;
+}
+
+/** Redact credentials and common private text before it is written to an audit log. */
+export function redactAuditText(value: string): string {
+  const withoutKeys = value
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]")
+    .replace(/\bhttps?:\/\/[^:\s/@]+:[^@\s/]+@/gi, (match) => `${match.slice(0, match.indexOf(":"))}://[redacted-userinfo]@`)
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[redacted-token]")
+    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/]{8,}=*/gi, "Bearer [redacted-token]")
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[redacted-access-key]")
     .replace(/\bghp_[A-Za-z0-9]{20,}\b/g, "[redacted-token]")
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "[redacted-token]")
-    .replace(/\bsk-[A-Za-z0-9]{20,}\b/g, "[redacted-token]");
+    .replace(/\bsk-[A-Za-z0-9]{20,}\b/g, "[redacted-token]")
+    .replace(
+      /\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*(?:"[^"\n]+"|'[^'\n]+'|\S+)/gi,
+      (_match, name: string) => `${name}=[redacted-secret]`,
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
+    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[redacted-ssn]")
+    .replace(/\+\d{8,15}\b/g, "[redacted-phone]")
+    .replace(/\b(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/g, "[redacted-phone]");
+  return withoutKeys.replace(/\b(?:\d[ -]?){13,19}\b/g, (match) => {
+    const digits = match.replace(/\D/g, "");
+    if (digits.length < 13 || digits.length > 19 || !passesLuhn(digits)) return match;
+    return "[redacted-card]";
+  });
 }
 
-function tracedGoal(goal: string): string {
-  const clean = redact(goal);
+function traceText(value: string, hostRedact?: (text: string) => string): string {
+  const bounded = value.length > 8_000 ? value.slice(0, 8_000) : value;
+  let text = bounded;
+  if (hostRedact) {
+    try {
+      const next = hostRedact(text);
+      if (typeof next !== "string") fail("invalid_redaction");
+      text = next;
+    } catch (error) {
+      if (error instanceof Error && error.message === "invalid_redaction") throw error;
+      return "[redaction-failed]";
+    }
+  }
+  const clean = redactAuditText(text);
   return clean.length > MAX_GOAL_CHARS ? `${clean.slice(0, MAX_GOAL_CHARS)}…` : clean;
 }
 
@@ -341,11 +434,33 @@ function copyAction(action: KernelAction, overrides: Partial<KernelAction> = {})
   return next;
 }
 
+function assertAdapterFns(value: object, names: readonly string[], code: string): void {
+  for (const name of names) {
+    if (typeof (value as Record<string, unknown>)[name] !== "function") fail(code);
+  }
+}
+
 /**
- * Create an isolated kernel for one product.
- * Instances do not share audit, stop state, or policy.
+ * Create a kernel for one product.
+ * Adapters are private to the instance unless the caller supplies shared ones.
+ * The default adapters are process-local.
  */
-export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
+export function createAgentKernel(configInput: AgentKernelConfig, adapters: KernelAdapters = {}): AgentKernel {
+  if (adapters === null || typeof adapters !== "object" || Array.isArray(adapters)) fail("invalid_adapters");
+  if (adapters.redact !== undefined && typeof adapters.redact !== "function") fail("invalid_redaction");
+  if (adapters.stopSwitch !== undefined) {
+    if (adapters.stopSwitch === null || typeof adapters.stopSwitch !== "object") fail("invalid_stop_switch");
+    assertAdapterFns(adapters.stopSwitch, ["isStopped", "stop", "resume", "currentReason"], "invalid_stop_switch");
+  }
+  if (adapters.auditLog !== undefined) {
+    if (adapters.auditLog === null || typeof adapters.auditLog !== "object") fail("invalid_audit_log");
+    assertAdapterFns(adapters.auditLog, ["append", "snapshot"], "invalid_audit_log");
+  }
+  if (adapters.idempotency !== undefined) {
+    if (adapters.idempotency === null || typeof adapters.idempotency !== "object") fail("invalid_idempotency_store");
+    assertAdapterFns(adapters.idempotency, ["get", "putIfAbsent"], "invalid_idempotency_store");
+  }
+
   const config = resolveConfig(configInput);
   const agents = new Map(config.agents.map((agent) => [agent.id, agent]));
   const contracts = new Map(config.actionContracts.map((contract) => [contract.id, contract]));
@@ -355,23 +470,18 @@ export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
       id: agent.id,
       matchers: agent.keywords.map((keyword) => compileMatcher(keyword, config.keywordMatch)),
     }));
-
-  const events: AuditEvent[] = [];
-  let dropped = 0;
-  let stopped = false;
-  let stopReason = "emergency_stop";
+  const stopSwitch = adapters.stopSwitch ?? createMemoryStopSwitch();
+  const auditLog = adapters.auditLog ?? createMemoryAuditLog(config.auditLimit);
+  const idempotency = adapters.idempotency ?? createMemoryIdempotencyStore();
+  const hostRedact = adapters.redact;
 
   function record(type: AuditEventType, detail: Record<string, AuditValue>): void {
-    events.push(Object.freeze({
+    auditLog.append(Object.freeze({
       at: new Date().toISOString(),
       productId: config.productId,
       type,
       detail: Object.freeze({ ...detail }),
     }));
-    while (events.length > config.auditLimit) {
-      events.shift();
-      dropped += 1;
-    }
   }
 
   function bindContract(action: KernelAction): KernelAction {
@@ -430,7 +540,7 @@ export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
       chiefAgentId: result.chiefAgentId,
       selectedAgentIds: result.selectedAgentIds.join(","),
       goalChars: goal.length,
-      goal: tracedGoal(goal),
+      goal: traceText(goal, hostRedact),
     });
     return result;
   }
@@ -518,29 +628,77 @@ export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
     return evidence.some((item) => isUsableVerified(item));
   }
 
+  function isClassified(action: KernelAction): boolean {
+    if (action.risk !== "money" && action.risk !== "privileged") return true;
+    if (action.externalEffect === true) return true;
+    const capability = action.capability?.trim();
+    if (!capability) return false;
+    return contracts.get(capability)?.risk === action.risk;
+  }
+
   function finish(
     action: KernelAction,
     result: CompleteResult,
     evidence: readonly Evidence[] = [],
+    replayed = false,
   ): CompleteResult {
+    const finalResult = Object.freeze(replayed ? { ...result, replayed: true } : { ...result });
     record("complete", {
       actionId: action.id,
-      status: result.status,
-      reason: result.reason,
+      status: finalResult.status,
+      reason: finalResult.reason,
       evidenceCount: evidence.length,
       verifiedCount: evidence.filter((item) => isUsableVerified(item)).length,
+      replayed,
     });
-    return Object.freeze(result);
+    return finalResult;
+  }
+
+  function readIdempotencyKey(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") fail("invalid_idempotency_key");
+    const key = value.trim();
+    return key === "" ? undefined : key;
+  }
+
+  function actionFingerprint(action: KernelAction): string {
+    return [
+      action.id,
+      action.agentId,
+      action.risk,
+      action.externalEffect === true ? "1" : "0",
+      action.capability ?? "",
+    ].join("\0");
+  }
+
+  function replayStored(action: KernelAction, record: IdempotencyRecord): CompleteResult {
+    return finish(action, record.result, [], true);
   }
 
   function complete(input: CompleteInput): CompleteResult {
     if (input === null || typeof input !== "object") fail("action_required");
     const action = bindContract(input.action);
     assertAction(action);
-    if (stopped) return finish(action, { status: "stopped", reason: stopReason });
+    if (stopSwitch.isStopped()) return finish(action, { status: "stopped", reason: stopSwitch.currentReason() });
+    if (!isClassified(action)) {
+      return finish(action, {
+        status: "blocked",
+        reason: "money_or_privileged_requires_external_effect_or_contract",
+      });
+    }
 
     const authority = authorize(action, input.approved);
     if (!authority.allowed) return finish(action, { status: "needs_approval", reason: authority.reason });
+
+    const key = readIdempotencyKey(input.idempotencyKey);
+    const fingerprint = actionFingerprint(action);
+    if (key) {
+      const existing = idempotency.get(key);
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) fail("idempotency_key_reused");
+        return replayStored(action, existing);
+      }
+    }
 
     const evidence = readEvidence(input.evidence);
     if (!evidenceSatisfied(action, evidence)) {
@@ -552,27 +710,38 @@ export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
     if (config.mode === "demo" && requiresEvidence(action)) {
       return finish(action, { status: "demo", reason: "demo_mode_not_live" }, evidence);
     }
-    return finish(action, { status: "complete", reason: "verified_or_internal" }, evidence);
+    const result = finish(action, { status: "complete", reason: "verified_or_internal" }, evidence);
+    if (!key) return result;
+    const put = idempotency.putIfAbsent(key, { fingerprint, result });
+    if (put.record.fingerprint !== fingerprint) fail("idempotency_key_reused");
+    if (!put.inserted) return replayStored(action, put.record);
+    return result;
   }
 
   function stop(reason = "emergency_stop"): void {
     if (typeof reason !== "string" || reason.trim() === "") fail("stop_reason_required");
-    stopped = true;
-    stopReason = reason.trim().slice(0, 200);
-    record("emergency_stop", { reason: stopReason });
+    const clean = reason.trim().slice(0, 200);
+    stopSwitch.stop(clean);
+    record("emergency_stop", { reason: traceText(clean, hostRedact) });
   }
 
   function resume(): void {
-    if (!stopped) return;
-    stopped = false;
+    if (!stopSwitch.isStopped()) return;
+    stopSwitch.resume();
     record("resume", {});
   }
 
   function audit(): AuditSnapshot {
-    return Object.freeze({
-      events: Object.freeze(events.slice()),
-      dropped,
-    });
+    const snapshot = auditLog.snapshot();
+    if (
+      snapshot === null
+      || typeof snapshot !== "object"
+      || !Array.isArray(snapshot.events)
+      || typeof snapshot.dropped !== "number"
+    ) {
+      fail("invalid_audit_snapshot");
+    }
+    return snapshot;
   }
 
   return Object.freeze({
@@ -583,7 +752,16 @@ export function createAgentKernel(configInput: AgentKernelConfig): AgentKernel {
     complete,
     stop,
     resume,
-    isStopped: () => stopped,
+    isStopped: () => stopSwitch.isStopped(),
     audit,
   });
+}
+
+/** Build the process-local reference adapters. Production hosts replace these. */
+export function createMemoryAdapters(auditLimit = 1000): KernelAdapters {
+  return {
+    stopSwitch: createMemoryStopSwitch(),
+    auditLog: createMemoryAuditLog(auditLimit),
+    idempotency: createMemoryIdempotencyStore(),
+  };
 }

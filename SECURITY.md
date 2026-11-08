@@ -11,20 +11,21 @@ Do not open a public issue for an unfixed bypass.
 ## Invariants that must not weaken
 
 - Gated risks (`external_write`, `money`, `privileged`) cannot be auto-allowed.
-- External effects and `external_write` actions cannot reach status `complete` without usable verified evidence.
-- Demo mode cannot report those actions as live-complete.
+- `money` and `privileged` actions cannot complete without `externalEffect` or an action contract that classifies them.
+- External effects and `external_write` actions cannot reach status `complete` without usable verified evidence. The default policy requires every supplied evidence item to be verified.
+- Demo mode cannot report external actions as live-complete.
 - An unknown agent is not silently given the action.
 - Policy objects returned by the kernel are frozen copies.
-- Emergency stop blocks completion.
-- Audit records decisions and evidence counts, not evidence payloads. Goals are truncated and common pasted credentials are redacted. The log can still contain private user text.
+- Emergency stop blocks completion, including replay of an already stored completion.
+- Audit records decisions and evidence counts, not evidence payloads. Stored text is truncated. Built-in redaction covers private keys, common tokens, secret assignments, emails, phone numbers, SSNs, and Luhn-valid card numbers. Names and product-specific phrases need the host `redact` function. If that function throws, the text is replaced with `[redaction-failed]` and the original is not stored.
 
 ## What this does not protect
 
-A host can ignore a `blocked` or `needs_approval` result and call a provider anyway. The kernel cannot stop that. Money movement without `externalEffect` or an action contract is treated as an internal write after approval; hosts must classify provider calls as external.
+A host can ignore a `blocked` or `needs_approval` result and call a provider anyway. The kernel cannot stop that. A host that sees `replayed: true` must skip the provider call. The kernel does not perform it.
 
-In-memory stop, audit, and the absence of an idempotency store are not multi-instance controls. Product databases have to provide those before external actions run in production.
+The reference stop switch, audit log, and idempotency store are process-local. Production adapters must persist them. The memory idempotency store must not be used for real money movement across processes.
 
-Secret scanning in CI covers private-key headers and a few credential prefixes in tracked files. Enable GitHub secret scanning and push protection on the repository as well. Dependency review runs through `npm audit` in CI.
+Secret scanning in CI covers private-key headers and a few credential prefixes in tracked files. Enable GitHub secret scanning and push protection on the repository as well. That setting is an owner action. Dependency review runs through `npm audit` in CI.
 
 ## Supply chain
 

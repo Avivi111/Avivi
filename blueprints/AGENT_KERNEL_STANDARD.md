@@ -52,12 +52,16 @@ Never ship a chat-only facade that claims work was completed without a real exec
 - a named agent cannot be given a capability it does not own
 - a read or internal action marked as an external effect is authorized as an external write
 - `external_write` and external effects cannot complete without usable verified evidence
-- demo mode cannot return `complete` for those actions
+- the default evidence rule is that every supplied item must be verified
+- `money` and `privileged` actions cannot complete unless they are external effects or named by an action contract
+- demo mode cannot return `complete` for external actions
 - an emergency stop blocks new completion
-- plan, route, authorization, completion, stop, and resume are appended to an in-memory audit log
+- plan, route, authorization, completion, stop, and resume are appended through an audit-log adapter
 
 The kernel does not execute tools. A status of `complete` means the host may record the outcome, not that a provider was called inside the kernel.
 
-Keyword matching defaults to the original substring rule. New apps should set `keywordMatch: "token"` so a short keyword does not match inside another word. Optional `actionContracts` make capability risk and external effect authoritative, so a caller cannot downgrade them.
+Keyword matching defaults to whole words (`token`). Set `keywordMatch: "substring"` when an existing configuration depended on fragment matches such as `pay` inside `payment`. Evidence defaults to `all_verified` because a failed read-back leaves the outcome unverified. Set `evidencePolicy: "any_verified"` only for the older "one verified item is enough" rule.
 
-Hosts still own product isolation, a durable audit, a durable emergency stop, idempotency for writes, and read-back from the real provider. In-memory stop and audit state do not survive a restart and are not shared across processes.
+Optional `actionContracts` make capability risk and external effect authoritative, so a caller cannot downgrade them. A contract is also the explicit classification for an internal money or privileged change.
+
+`createAgentKernel(config, adapters)` accepts a stop switch, an audit log, and an idempotency store. The reference adapters in `blueprints/memory-adapters.ts` are process-local. Production hosts supply durable implementations. An idempotency key lets a repeated `complete` return `replayed: true` instead of looking like a second effect. The host still has to skip the provider call.

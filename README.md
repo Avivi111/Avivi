@@ -63,14 +63,15 @@ kernel.complete({
 
 ## Safety invariants
 
-Valid success paths are unchanged:
+The success path is:
 
-- a non-empty goal selects the chief, then specialists whose keywords match
-- keyword matching is a case-insensitive substring unless `keywordMatch` is `"token"`
+- a non-empty goal selects the chief, then specialists whose keywords match as whole words
+- keyword matching is case-insensitive. The default is `token`. Set `keywordMatch: "substring"` to keep the previous rule, where `pay` also matches `payment`
 - `read` and `internal_write` may be auto-allowed
 - every other risk needs an explicit `approved: true`
-- an external effect needs at least one verified evidence item with a source and a parseable `checkedAt`
+- an external effect needs every supplied evidence item to be verified, each with a source and a parseable `checkedAt`. Set `evidencePolicy: "any_verified"` only when an extra unverified note is attached beside one good read-back
 - approval is checked before evidence
+- `money` and `privileged` actions need `externalEffect: true` or an action contract. A contract is how a product explicitly classifies an internal ledger or privilege change
 
 These paths fail closed:
 
@@ -81,28 +82,50 @@ These paths fail closed:
 - a risk cannot appear in both `autoAllow` and `alwaysRequireApproval`
 - a read or internal action flagged `externalEffect` is authorized as an external write
 - `external_write` requires evidence even if `externalEffect` was left unset
+- `money` and `privileged` actions with neither `externalEffect` nor a matching action contract return `money_or_privileged_requires_external_effect_or_contract`
 - verified evidence with a blank source or an unparseable time does not count
+- a failed or unverified evidence item blocks completion under the default `all_verified` policy
 - only the boolean `true` counts as approval
 - the kernel's copy of the policy is frozen, so mutating the caller's arrays later cannot widen authority
 - `mode: "demo"` can exercise the approval and evidence gates, and still cannot return `complete` for external work
-- `stop()` blocks new completion until `resume()`
-- plan, route, authorize, complete, stop, and resume are written to an in-memory audit log
-- goals stored in the audit are truncated and obvious pasted credentials are redacted
+- the emergency stop, `stop()`, blocks new completion until `resume()`
+- plan, route, authorize, complete, stop, and resume are written to the audit log
+- text written to the audit is truncated. Credentials, emails, phone numbers, payment card numbers, SSNs, and secret assignments are redacted. A host `redact` function can cover product-specific private text. If that function throws, the text is dropped
 
-Set `evidencePolicy: "all_verified"` when a failed read-back must veto an otherwise verified one. The default remains any verified item.
+## Defaults changed
 
-Set `actionContracts` when a capability's risk and external effect should come from the product, not from the caller. With contracts enabled, every agent capability needs a contract, the caller's risk must match, and a contracted external effect cannot be omitted.
+Kernels created without an explicit `keywordMatch` now use `token`. Kernels created without an explicit `evidencePolicy` now use `all_verified`. Set the previous values on an existing configuration that depended on them:
+
+```ts
+keywordMatch: "substring",
+evidencePolicy: "any_verified",
+```
+
+`all_verified` is the default because a failed provider read-back means the outcome is not verified. One successful item does not erase a failed one.
+
+## Adapters
+
+Stop, audit, and idempotency are interfaces. `createMemoryStopSwitch`, `createMemoryAuditLog`, and `createMemoryIdempotencyStore` are the reference adapters. They are process-local. Pass durable implementations to `createAgentKernel(config, adapters)` before production traffic. `auditLimit` applies only to the default memory audit log.
+
+```ts
+const kernel = createAgentKernel(config, {
+  stopSwitch,
+  auditLog,
+  idempotency,
+  redact(text) {
+    return text.replaceAll("Project Falcon", "[redacted-private]");
+  },
+});
+```
+
+Pass `idempotencyKey` on `complete` for an external write. A repeat with the same key and the same action returns the stored result with `replayed: true`. The kernel still does not perform the side effect. Skip the provider call when `replayed` is true. A durable store has to implement `putIfAbsent` with a uniqueness constraint. The memory store does not survive a restart.
 
 ## What hosts still own
 
-The kernel is per process and in memory.
-
-- Persist the audit log. It can contain user goals. Treat it as sensitive. The kernel keeps at most `auditLimit` events (default 1000) and then drops the oldest.
-- Persist the emergency stop. `stop()` does not cross processes or restarts.
-- Give external writes a uniqueness key in the product database. This kernel does not implement durable idempotency, because a lossy in-memory key would be unsafe for money movement.
+- Replace the memory adapters with durable ones before external actions run in production. Treat the audit log as sensitive.
 - Keep database, auth, secrets, memory, provider tokens, and audit product-specific.
-- Set `externalEffect` or an action contract on money and privileged work that leaves the product. An approved money action with no external effect can still complete without provider evidence; that path is only for an internal ledger change.
-- Execute the tool only after status `complete`. Calling `complete` again does not mean the side effect was skipped; the kernel never performs it.
+- Execute the tool only after status `complete`.
+- Choose a license. `LICENSE` is a proposal and an all-rights-reserved placeholder, not a grant.
 
 ## Development
 
@@ -118,4 +141,4 @@ Node's type stripping is experimental on the test command. The published entry i
 
 ## License
 
-No license is set. The copyright holder reserves all rights. Do not treat this public repository as open source until a license is added.
+`LICENSE` is a clearly marked proposal for the owner. Until the owner replaces it, all rights are reserved. The file is not an open-source grant and it is not legal advice.

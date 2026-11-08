@@ -36,6 +36,13 @@ describe("repository guardrails", () => {
     assert.match(readme, /does not execute tools/i);
   });
 
+  it("keeps LICENSE as an all-rights-reserved proposal", () => {
+    const license = readFileSync(path.join(root, "LICENSE"), "utf8");
+    assert.match(license, /PROPOSAL — NOT A LICENSE GRANT/);
+    assert.match(license, /all rights are reserved/i);
+    assert.equal(/permission is hereby granted/i.test(license), false);
+  });
+
   it("keeps the kernel free of IO and network calls", () => {
     const source = readFileSync(path.join(root, "blueprints/agent-kernel.ts"), "utf8");
     assert.doesNotMatch(source, /\bfrom ["']node:/);

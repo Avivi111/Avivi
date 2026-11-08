@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   createAgentKernel,
+  createMemoryAuditLog,
+  createMemoryIdempotencyStore,
+  createMemoryStopSwitch,
   type AgentKernel,
   type AgentKernelConfig,
   type AgentRisk,
   type Evidence,
   type KernelAction,
+  type KernelAdapters,
 } from "../blueprints/agent-kernel.ts";
 
 const verified: Evidence = {
@@ -36,8 +40,8 @@ function billingConfig(overrides: Partial<AgentKernelConfig> = {}): AgentKernelC
   };
 }
 
-function billingKernel(overrides: Partial<AgentKernelConfig> = {}): AgentKernel {
-  return createAgentKernel(billingConfig(overrides));
+function billingKernel(overrides: Partial<AgentKernelConfig> = {}, adapters?: KernelAdapters): AgentKernel {
+  return createAgentKernel(billingConfig(overrides), adapters);
 }
 
 function contractedKernel(overrides: Partial<AgentKernelConfig> = {}): AgentKernel {
@@ -53,7 +57,7 @@ function contractedKernel(overrides: Partial<AgentKernelConfig> = {}): AgentKern
 }
 
 describe("planning", () => {
-  it("preserves chief-first specialist selection and case-insensitive substring keywords", () => {
+  it("selects the chief first and matches whole keywords regardless of case", () => {
     const kernel = billingKernel();
     assert.deepEqual(kernel.plan("  Email the INVOICE  "), {
       goal: "Email the INVOICE",
@@ -64,24 +68,26 @@ describe("planning", () => {
     assert.deepEqual(kernel.plan("unrelated request").selectedAgentIds, ["chief"]);
   });
 
-  it("keeps the original substring rule, including short keywords inside longer words", () => {
+  it("defaults to whole-word keywords and can opt into the old substring rule", () => {
     const config = billingConfig({
       agents: [
         { id: "chief", purpose: "Own the user goal", keywords: [], capabilities: ["route"] },
         { id: "billing", purpose: "Payments", keywords: ["pay", "a.b"], capabilities: ["refund_payment"] },
       ],
     });
-    const substring = createAgentKernel(config);
-    assert.deepEqual(substring.plan("payment").selectedAgentIds, ["chief", "billing"]);
-    assert.deepEqual(substring.plan("xa.bx").selectedAgentIds, ["chief", "billing"]);
-    assert.deepEqual(substring.plan("axb").selectedAgentIds, ["chief"]);
-
-    const token = createAgentKernel({ ...config, keywordMatch: "token" });
+    const token = createAgentKernel(config);
+    assert.equal(token.config.keywordMatch, "token");
+    assert.equal(token.config.evidencePolicy, "all_verified");
     assert.deepEqual(token.plan("payment").selectedAgentIds, ["chief"]);
     assert.deepEqual(token.plan("please pay now").selectedAgentIds, ["chief", "billing"]);
     assert.deepEqual(token.plan("please pay.").selectedAgentIds, ["chief", "billing"]);
     assert.deepEqual(token.plan("axb").selectedAgentIds, ["chief"]);
     assert.deepEqual(token.plan("use a.b today").selectedAgentIds, ["chief", "billing"]);
+
+    const substring = createAgentKernel({ ...config, keywordMatch: "substring" });
+    assert.deepEqual(substring.plan("payment").selectedAgentIds, ["chief", "billing"]);
+    assert.deepEqual(substring.plan("xa.bx").selectedAgentIds, ["chief", "billing"]);
+    assert.deepEqual(substring.plan("axb").selectedAgentIds, ["chief"]);
   });
 
   it("matches padded keywords after trimming, and rejects a blank keyword", () => {
@@ -239,7 +245,7 @@ describe("authority and evidence", () => {
     });
   });
 
-  it("does not let one verified read-back hide a failed one when every item must be verified", () => {
+  it("treats a failed read-back as a veto unless the host opts into any verified item", () => {
     const kernel = billingKernel();
     const action = kernel.route({
       id: "act_email",
@@ -249,20 +255,20 @@ describe("authority and evidence", () => {
       externalEffect: true,
     });
     const mixed = [verified, { ...verified, state: "failed" as const, source: "mailbox" }];
-    assert.equal(kernel.complete({ action, approved: true, evidence: mixed }).status, "complete");
+    assert.equal(
+      kernel.complete({ action, approved: true, evidence: mixed }).reason,
+      "evidence_not_fully_verified",
+    );
 
-    const strict = billingKernel({ evidencePolicy: "all_verified" });
-    const strictAction = strict.route({
+    const loose = billingKernel({ evidencePolicy: "any_verified" });
+    const looseAction = loose.route({
       id: "act_email",
       title: "Send status email",
       risk: "external_write",
       capability: "send_email",
       externalEffect: true,
     });
-    assert.equal(
-      strict.complete({ action: strictAction, approved: true, evidence: mixed }).reason,
-      "evidence_not_fully_verified",
-    );
+    assert.equal(loose.complete({ action: looseAction, approved: true, evidence: mixed }).status, "complete");
   });
 
   it("fails closed when a read action is actually an external effect", () => {
@@ -292,16 +298,57 @@ describe("authority and evidence", () => {
     assert.equal(kernel.complete({ action, approved: true, evidence: [verified] }).status, "complete");
   });
 
-  it("keeps approved internal money completion when no external effect was declared", () => {
+  it("blocks unclassified money and privileged actions, and allows a contracted internal one", () => {
     const kernel = billingKernel();
-    const action = kernel.route({
+    const money = kernel.route({
       id: "ledger",
       title: "Record internal adjustment",
       risk: "money",
       agentId: "billing",
     });
-    assert.equal(kernel.authorize(action).allowed, false);
-    assert.equal(kernel.complete({ action, approved: true }).status, "complete");
+    const privileged = kernel.route({
+      id: "role",
+      title: "Change a role",
+      risk: "privileged",
+      agentId: "billing",
+    });
+    assert.equal(kernel.authorize(money).allowed, false);
+    assert.equal(
+      kernel.complete({ action: money, approved: true }).reason,
+      "money_or_privileged_requires_external_effect_or_contract",
+    );
+    assert.equal(
+      kernel.complete({ action: privileged }).reason,
+      "money_or_privileged_requires_external_effect_or_contract",
+    );
+
+    const external = kernel.route({
+      id: "refund",
+      title: "Refund invoice",
+      risk: "money",
+      externalEffect: true,
+      capability: "refund_payment",
+    });
+    assert.equal(kernel.complete({ action: external, approved: true }).reason, "external_effect_requires_verified_evidence");
+    assert.equal(kernel.complete({ action: external, approved: true, evidence: [verified] }).status, "complete");
+
+    const classified = billingKernel({
+      agents: [
+        { id: "chief", purpose: "Own the user goal", keywords: [], capabilities: ["route"] },
+        { id: "billing", purpose: "Invoices", keywords: ["invoice"], capabilities: ["adjust_ledger"] },
+      ],
+      actionContracts: [
+        { id: "route", risk: "read" },
+        { id: "adjust_ledger", risk: "money", externalEffect: false },
+      ],
+    });
+    const ledger = classified.route({
+      id: "ledger",
+      title: "Record internal adjustment",
+      risk: "money",
+      capability: "adjust_ledger",
+    });
+    assert.equal(classified.complete({ action: ledger, approved: true }).status, "complete");
   });
 
   it("rejects a non-boolean approval", () => {
@@ -427,6 +474,44 @@ describe("audit", () => {
       (kernel.audit().events as Array<unknown>).push({});
     });
   });
+
+  it("redacts private text and drops the goal when a host redactor throws", () => {
+    const kernel = billingKernel();
+    const email = "person@example.com";
+    const phone = "+14155550100";
+    const card = "4242" + "4242" + "4242" + "4242";
+    const jwt = `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.${"signaturevalue"}`;
+    kernel.plan(`Email ${email}, call ${phone}, card ${card}, password=correct-horse, ${jwt}`);
+    const goal = String(kernel.audit().events[0]?.detail.goal);
+    assert.match(goal, /\[redacted-email\]/);
+    assert.match(goal, /\[redacted-phone\]/);
+    assert.match(goal, /\[redacted-card\]/);
+    assert.match(goal, /password=\[redacted-secret\]/);
+    assert.match(goal, /\[redacted-token\]/);
+    assert.equal(goal.includes(email), false);
+    assert.equal(goal.includes(phone), false);
+    assert.equal(goal.includes(card), false);
+    assert.equal(goal.includes("correct-horse"), false);
+    assert.equal(goal.includes(jwt), false);
+
+    const custom = billingKernel({}, {
+      redact(text: string) {
+        return text.replaceAll("Project Falcon", "[redacted-private]");
+      },
+    });
+    custom.plan("Project Falcon needs an invoice");
+    assert.equal(JSON.stringify(custom.audit()).includes("Project Falcon"), false);
+    assert.match(String(custom.audit().events[0]?.detail.goal), /\[redacted-private\]/);
+
+    const failing = billingKernel({}, {
+      redact() {
+        throw new Error("boom");
+      },
+    });
+    failing.plan("secret plan about the invoice");
+    assert.equal(failing.audit().events[0]?.detail.goal, "[redaction-failed]");
+    assert.equal(JSON.stringify(failing.audit()).includes("secret plan"), false);
+  });
 });
 
 describe("action contracts", () => {
@@ -540,5 +625,101 @@ describe("configuration integrity", () => {
     assert.throws(() => {
       (kernel.config.agents[1]?.keywords as string[]).push("secret");
     });
+  });
+});
+
+describe("persistence adapters", () => {
+  function emailAction(kernel: AgentKernel): KernelAction {
+    return kernel.route({
+      id: "act_email",
+      title: "Send status email",
+      risk: "external_write",
+      capability: "send_email",
+      externalEffect: true,
+    });
+  }
+
+  it("replays a completed action for the same idempotency key and rejects a different action", () => {
+    const kernel = billingKernel();
+    const action = emailAction(kernel);
+    const first = kernel.complete({
+      action,
+      approved: true,
+      evidence: [verified],
+      idempotencyKey: " email-1 ",
+    });
+    assert.equal(first.status, "complete");
+    assert.equal(first.replayed, undefined);
+
+    const replay = kernel.complete({ action, approved: true, idempotencyKey: "email-1" });
+    assert.deepEqual(replay, { status: "complete", reason: "verified_or_internal", replayed: true });
+
+    const other = kernel.route({
+      id: "act_other",
+      title: "Send another email",
+      risk: "external_write",
+      capability: "send_email",
+      externalEffect: true,
+    });
+    assert.throws(
+      () => kernel.complete({ action: other, approved: true, evidence: [verified], idempotencyKey: "email-1" }),
+      { message: "idempotency_key_reused" },
+    );
+    assert.equal(kernel.complete({ action, idempotencyKey: "email-1" }).status, "needs_approval");
+  });
+
+  it("does not replay a completion while the stop switch is engaged", () => {
+    const kernel = billingKernel();
+    const action = emailAction(kernel);
+    kernel.complete({ action, approved: true, evidence: [verified], idempotencyKey: "email-2" });
+    kernel.stop();
+    const stopped = kernel.complete({ action, approved: true, idempotencyKey: "email-2" });
+    assert.equal(stopped.status, "stopped");
+    assert.equal(stopped.replayed, undefined);
+  });
+
+  it("shares a stop switch, audit log, and idempotency store across kernels", () => {
+    const stopSwitch = createMemoryStopSwitch();
+    const auditLog = createMemoryAuditLog(10);
+    const idempotency = createMemoryIdempotencyStore();
+    const adapters = { stopSwitch, auditLog, idempotency };
+    const first = billingKernel({ productId: "billing" }, adapters);
+    const second = billingKernel({ productId: "support" }, adapters);
+    const action = emailAction(first);
+    first.complete({ action, approved: true, evidence: [verified], idempotencyKey: "shared-email" });
+    const replay = second.complete({ action, approved: true, idempotencyKey: "shared-email" });
+    assert.equal(replay.replayed, true);
+    assert.equal(first.audit().events.length, second.audit().events.length);
+    assert.ok(first.audit().events.some((event) => event.productId === "support"));
+
+    first.stop("halt both");
+    assert.equal(second.isStopped(), true);
+    const read = second.route({ id: "list", title: "List invoices", risk: "read", agentId: "billing" });
+    assert.equal(second.complete({ action: read }).reason, "halt both");
+  });
+
+  it("lets a supplied audit log own retention", () => {
+    const kernel = billingKernel({ auditLimit: 50 }, { auditLog: createMemoryAuditLog(1) });
+    kernel.plan("one");
+    kernel.plan("two");
+    assert.equal(kernel.audit().dropped, 1);
+    assert.equal(kernel.audit().events[0]?.detail.goal, "two");
+  });
+
+  it("keeps the first idempotency record", () => {
+    const store = createMemoryIdempotencyStore();
+    const first = {
+      fingerprint: "a",
+      result: { status: "complete" as const, reason: "verified_or_internal" },
+    };
+    const second = {
+      fingerprint: "b",
+      result: { status: "blocked" as const, reason: "external_effect_requires_verified_evidence" },
+    };
+    assert.equal(store.putIfAbsent("k", first).inserted, true);
+    const again = store.putIfAbsent("k", second);
+    assert.equal(again.inserted, false);
+    assert.equal(again.record.fingerprint, "a");
+    assert.equal(store.get("missing"), undefined);
   });
 });
