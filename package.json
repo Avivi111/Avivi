@@ -1,0 +1,38 @@
+{
+  "name": "avivi-agent-kernel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference agent kernel for Avivi products: one chief, specialist routing, authority, evidence, and audit.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Avivi111/Avivi.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/agent-kernel.d.ts",
+      "import": "./dist/agent-kernel.js"
+    }
+  },
+  "types": "./dist/agent-kernel.d.ts",
+  "files": [
+    "dist",
+    "blueprints",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --experimental-strip-types --test tests/*.test.ts && node --test tests/*.test.mjs",
+    "audit:deps": "npm audit --audit-level=moderate"
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
